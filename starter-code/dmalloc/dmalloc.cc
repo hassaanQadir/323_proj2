@@ -45,16 +45,15 @@ static void remove_from_alloc_list(allocation_header* node) {
 // ----- DMALLOC FUNCTIONS -----
 
 void* dmalloc_malloc(size_t sz, const char* file, long line) {
-    // 1) Check for overflow
+    // 1. Check for overflow
     size_t total_size;
     if (__builtin_add_overflow(sz, sizeof(allocation_header), &total_size)) {
-        // record failure
         stats.nfail++;
         stats.fail_size += sz;
         return nullptr;
     }
 
-    // 2) Allocate
+    // 2. Allocate
     allocation_header* header = (allocation_header*) base_malloc(total_size);
     if (!header) {
         stats.nfail++;
@@ -62,30 +61,32 @@ void* dmalloc_malloc(size_t sz, const char* file, long line) {
         return nullptr;
     }
 
-    // 3) Fill in metadata
+    // 3. Initialize the metadata and insert into linked list
     header->size = sz;
     header->file = file;
     header->line = line;
     insert_into_alloc_list(header);
 
-    // 4) Update statistics
+    // 4. Update statistics
     stats.ntotal++;
     stats.total_size += sz;
     stats.nactive++;
     stats.active_size += sz;
 
-    uintptr_t start = (uintptr_t) header;
-    uintptr_t end   = start + total_size - 1;
-    if (stats.heap_min == 0 || start < stats.heap_min) {
-        stats.heap_min = start;
+    // 5. Update heap_min/heap_max using *user* region
+    uintptr_t user_start = (uintptr_t) (header + 1);
+    uintptr_t user_end_exclusive = user_start + sz;    // pointer + size
+    if (stats.heap_min == 0 || user_start < stats.heap_min) {
+        stats.heap_min = user_start;
     }
-    if (end > stats.heap_max) {
-        stats.heap_max = end;
+    if (user_end_exclusive > stats.heap_max) {
+        stats.heap_max = user_end_exclusive;
     }
 
-    // 5) Return pointer to usable memory
+    // 6. Return pointer after metadata
     return (void*) (header + 1);
 }
+
 
 void dmalloc_free(void* ptr, const char* file, long line) {
     (void) file;

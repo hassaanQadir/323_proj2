@@ -1,1 +1,0 @@
-test009: test009.cc:12: int main(): Assertion `(uintptr_t) p + 10 <= stat.heap_max' failed.

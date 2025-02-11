@@ -1,3 +1,5 @@
+// dmalloc.cc
+
 #define M61_DISABLE 1
 #include "dmalloc.hh"
 #include <cstdlib>
@@ -6,88 +8,143 @@
 #include <cinttypes>
 #include <cassert>
 
-// You may write code here.
-// (Helper functions, types, structs, macros, globals, etc.)
+// ----- GLOBAL STATE -----
 
+static dmalloc_statistics stats;
 
-/// dmalloc_malloc(sz, file, line)
-///    Return a pointer to `sz` bytes of newly-allocated dynamic memory.
-///    The memory is not initialized. If `sz == 0`, then dmalloc_malloc must
-///    return a unique, newly-allocated pointer value. The allocation
-///    request was at location `file`:`line`.
+struct allocation_header {
+    size_t size;
+    const char* file;
+    long line;
+    allocation_header* prev;
+    allocation_header* next;
+};
+
+static allocation_header* alloc_list_head = nullptr;
+
+static void insert_into_alloc_list(allocation_header* node) {
+    node->prev = nullptr;
+    node->next = alloc_list_head;
+    if (alloc_list_head) {
+        alloc_list_head->prev = node;
+    }
+    alloc_list_head = node;
+}
+
+static void remove_from_alloc_list(allocation_header* node) {
+    if (node->prev) {
+        node->prev->next = node->next;
+    } else {
+        alloc_list_head = node->next;
+    }
+    if (node->next) {
+        node->next->prev = node->prev;
+    }
+}
+
+// ----- DMALLOC FUNCTIONS -----
 
 void* dmalloc_malloc(size_t sz, const char* file, long line) {
-    (void) file, (void) line;   // avoid uninitialized variable warnings
-    // Your code here.
-    return base_malloc(sz);
+    // 1) Check for overflow
+    size_t total_size;
+    if (__builtin_add_overflow(sz, sizeof(allocation_header), &total_size)) {
+        // record failure
+        stats.nfail++;
+        stats.fail_size += sz;
+        return nullptr;
+    }
+
+    // 2) Allocate
+    allocation_header* header = (allocation_header*) base_malloc(total_size);
+    if (!header) {
+        stats.nfail++;
+        stats.fail_size += sz;
+        return nullptr;
+    }
+
+    // 3) Fill in metadata
+    header->size = sz;
+    header->file = file;
+    header->line = line;
+    insert_into_alloc_list(header);
+
+    // 4) Update statistics
+    stats.ntotal++;
+    stats.total_size += sz;
+    stats.nactive++;
+    stats.active_size += sz;
+
+    uintptr_t start = (uintptr_t) header;
+    uintptr_t end   = start + total_size - 1;
+    if (stats.heap_min == 0 || start < stats.heap_min) {
+        stats.heap_min = start;
+    }
+    if (end > stats.heap_max) {
+        stats.heap_max = end;
+    }
+
+    // 5) Return pointer to usable memory
+    return (void*) (header + 1);
 }
-
-
-/// dmalloc_free(ptr, file, line)
-///    Free the memory space pointed to by `ptr`, which must have been
-///    returned by a previous call to dmalloc_malloc. If `ptr == NULL`,
-///    does nothing. The free was called at location `file`:`line`.
 
 void dmalloc_free(void* ptr, const char* file, long line) {
-    (void) file, (void) line;   // avoid uninitialized variable warnings
-    // Your code here.
-    base_free(ptr);
+    (void) file;
+    (void) line;
+
+    if (!ptr) {
+        return;  // free(nullptr) is no-op
+    }
+
+    // 1) Recover our header
+    allocation_header* header = (allocation_header*) ptr - 1;
+
+    // 2) Remove from active list
+    remove_from_alloc_list(header);
+
+    // 3) Update statistics
+    stats.nactive--;
+    stats.active_size -= header->size;
+
+    // 4) Free
+    base_free(header);
 }
 
-
-/// dmalloc_calloc(nmemb, sz, file, line)
-///    Return a pointer to newly-allocated dynamic memory big enough to
-///    hold an array of `nmemb` elements of `sz` bytes each. If `sz == 0`,
-///    then must return a unique, newly-allocated pointer value. Returned
-///    memory should be initialized to zero. The allocation request was at
-///    location `file`:`line`.
-
 void* dmalloc_calloc(size_t nmemb, size_t sz, const char* file, long line) {
-    // Your code here (to fix test014).
-    void* ptr = dmalloc_malloc(nmemb * sz, file, line);
+    size_t total;
+    if (__builtin_mul_overflow(nmemb, sz, &total)) {
+        stats.nfail++;
+        stats.fail_size += (nmemb * sz);
+        return nullptr;
+    }
+    void* ptr = dmalloc_malloc(total, file, line);
     if (ptr) {
-        memset(ptr, 0, nmemb * sz);
+        memset(ptr, 0, total);
     }
     return ptr;
 }
 
-
-/// dmalloc_get_statistics(stats)
-///    Store the current memory statistics in `*stats`.
-
-void dmalloc_get_statistics(dmalloc_statistics* stats) {
-    // Stub: set all statistics to enormous numbers
-    memset(stats, 255, sizeof(dmalloc_statistics));
-    // Your code here.
+void dmalloc_get_statistics(dmalloc_statistics* s) {
+    *s = stats;
 }
-
-
-/// dmalloc_print_statistics()
-///    Print the current memory statistics.
 
 void dmalloc_print_statistics() {
-    dmalloc_statistics stats;
-    dmalloc_get_statistics(&stats);
+    dmalloc_statistics s;
+    dmalloc_get_statistics(&s);
 
     printf("alloc count: active %10llu   total %10llu   fail %10llu\n",
-           stats.nactive, stats.ntotal, stats.nfail);
+           s.nactive, s.ntotal, s.nfail);
     printf("alloc size:  active %10llu   total %10llu   fail %10llu\n",
-           stats.active_size, stats.total_size, stats.fail_size);
+           s.active_size, s.total_size, s.fail_size);
 }
-
-
-/// dmalloc_print_leak_report()
-///    Print a report of all currently-active allocated blocks of dynamic
-///    memory.
 
 void dmalloc_print_leak_report() {
-    // Your code here.
+    for (allocation_header* p = alloc_list_head; p; p = p->next) {
+        // Example format
+        printf("LEAK CHECK: %p size %zu alloc [%s:%ld]\n",
+               (void*) (p + 1), p->size, p->file, p->line);
+    }
 }
 
-
-/// dmalloc_print_heavy_hitter_report()
-///    Print a report of heavily-used allocation locations.
-
 void dmalloc_print_heavy_hitter_report() {
-    // Your heavy-hitters code here
+    // Not yet implemented for part 1.1
 }

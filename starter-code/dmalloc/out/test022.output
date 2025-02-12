@@ -1,3 +1,0 @@
-Bad pointer 0x1bd2f68
-MEMORY BUG: test022.cc:10: invalid free of pointer 0x1bd2f68, not allocated
-  test022.cc:8: 0x1bd2f68 is 128 bytes inside a 2001 byte region allocated here

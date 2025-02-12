@@ -1,2 +1,2 @@
-Bad pointer 0x107a5f68
-MEMORY BUG: test021.cc:10: invalid free of pointer 0x107a5f68, not allocated
+Bad pointer 0x2ce68f68
+MEMORY BUG: test021.cc:10: invalid free of pointer 0x2ce68f68, not allocated

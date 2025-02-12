@@ -1,2 +1,2 @@
-Will free 0x32fe3ee8
-MEMORY BUG: test020.cc:11: invalid free of pointer 0x32fe3ee8, double free
+Will free 0x3aedee8
+MEMORY BUG: test020.cc:11: invalid free of pointer 0x3aedee8, double free

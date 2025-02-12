@@ -1,0 +1,2 @@
+EXPECTED LEAK: 0x25043d38 with size 8
+LEAK CHECK: 0x25043d38 size 8 alloc [test029.cc:16]

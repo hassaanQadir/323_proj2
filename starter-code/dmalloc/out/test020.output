@@ -1,2 +1,2 @@
-Will free 0x35656ee8
-MEMORY BUG: test020.cc:11: invalid free of pointer 0x35656ee8, not allocated
+Will free 0x32fe3ee8
+MEMORY BUG: test020.cc:11: invalid free of pointer 0x32fe3ee8, double free

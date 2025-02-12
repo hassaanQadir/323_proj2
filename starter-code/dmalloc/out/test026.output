@@ -1,2 +1,2 @@
-About to free 0x3ad0eee8
-MEMORY BUG: test026.cc:13: detected wild write during free of pointer 0x3ad0eee8
+About to free 0x7773ee8
+MEMORY BUG: test026.cc:13: detected wild write during free of pointer 0x7773ee8

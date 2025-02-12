@@ -1,3 +1,3 @@
-Bad pointer 0x1782f67
-MEMORY BUG: test023.cc:10: invalid free of pointer 0x1782f67, not allocated
-  test023.cc:8: 0x1782f67 is 127 bytes inside a 2001 byte region allocated here
+Bad pointer 0x9d40f67
+MEMORY BUG: test023.cc:10: invalid free of pointer 0x9d40f67, not allocated
+  test023.cc:8: 0x9d40f67 is 127 bytes inside a 2001 byte region allocated here

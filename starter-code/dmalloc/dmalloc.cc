@@ -5,10 +5,13 @@
 #include <cstdio>
 #include <cinttypes>
 #include <cassert>
+#include <cstdarg> 
 
 // You need these headers for the data structures
 #include <map>
 #include <unordered_map>
+#include <vector>
+#include <algorithm>
 
 // ----- GLOBAL STATE -----
 
@@ -130,6 +133,68 @@ static void remove_from_active_lists(allocation_header* header) {
 }
 
 
+/// Helper: print out the error message and abort.
+/// Use `abort()` or `exit(1)` as you prefer.
+// static void memory_bug(const char* file, long line, const char* fmt, ...) {
+//     va_list args;
+//     va_start(args, fmt);
+//     fprintf(stderr, "MEMORY BUG: %s:%ld: ", file, line);
+//     vfprintf(stderr, fmt, args);
+//     fprintf(stderr, "\n");
+//     va_end(args);
+//     abort();
+// }
+
+
+// ----- "Heavy Hitters" Data Structures -----
+//
+// We'll store the total allocated bytes for each (file, line) pair
+// in a global unordered_map. Key: (file*, line), Value: total bytes allocated.
+//
+// Then we have a global "total_alloc_bytes_for_heavy" that accumulates
+// the sum of all user-requested bytes. 
+//
+// You *could* do sampling here to handle large workloads, but an
+// efficient map or hash approach (like std::unordered_map) is usually fine
+// for up to tens or hundreds of thousands of distinct call sites.
+//
+// If you do want to do sampling, just sample 1/N allocations and multiply
+// by N in your final totals. But the direct approach shown here often works
+// for the assignment.
+
+struct fileline {
+    const char* file;
+    long line;
+};
+
+struct fileline_hash {
+    // Basic pointer+line combination as hash. 
+    // We rely on pointer identity for `file` because the assignment
+    // states `file` has static storage duration. 
+    std::size_t operator()(fileline const& fl) const {
+        // A common pattern is to combine the pointer bits and line bits.
+        // Something simple:
+        auto h1 = std::hash<const char*>()(fl.file);
+        auto h2 = std::hash<long>()(fl.line);
+        // combine
+        // 0x9e3779b97f4a7c15 is a recommended "magic" constant (from boost)
+        static const size_t magic = 0x9e3779b97f4a7c15ULL;
+        // just a typical approach
+        h1 ^= (h2 + magic + (h1 << 6) + (h1 >> 2));
+        return h1;
+    }
+};
+
+struct fileline_eq {
+    bool operator()(fileline const& a, fileline const& b) const {
+        return a.file == b.file && a.line == b.line;
+    }
+};
+
+// Global container for heavy-hitter stats
+static std::unordered_map<fileline, unsigned long long, fileline_hash, fileline_eq> heavy_map;
+static unsigned long long total_heavy_alloc = 0;  // total user bytes allocated
+
 // ----- DMALLOC FUNCTIONS -----
 
 void* dmalloc_malloc(size_t user_size, const char* file, long line) {
@@ -160,7 +225,7 @@ void* dmalloc_malloc(size_t user_size, const char* file, long line) {
     header->line        = line;
     header->active      = true;
 
-    // Insert in the doubly-linked list (for later leak reports)
+    // Insert in the doubly-linked list (for leak reports)
     insert_into_allocation_list(header);
 
     // 4. Write the right canary after the user region
@@ -169,7 +234,7 @@ void* dmalloc_malloc(size_t user_size, const char* file, long line) {
         = (unsigned long long*)((char*) user_ptr + user_size);
     *right_canary = CANARY_MAGIC;
 
-    // 5. Update statistics
+    // 5. Update the aggregator statistics
     stats.ntotal++;
     stats.total_size += user_size;
     stats.nactive++;
@@ -189,7 +254,12 @@ void* dmalloc_malloc(size_t user_size, const char* file, long line) {
     active_blocks_map[user_ptr] = header;
     active_blocks_interval[start] = header;
 
-    // 8. Return the user pointer
+    // 8. Track heavy-hitter data
+    fileline fl{file, line};
+    heavy_map[fl] += user_size;
+    total_heavy_alloc += user_size;
+
+    // 9. Return the user pointer
     return user_ptr;
 }
 
@@ -217,10 +287,8 @@ void dmalloc_free(void* ptr, const char* file, long line) {
     if (!header) {
         // Not an exact match => maybe it's inside some other block?
         allocation_header* container = find_header_containing(pval);
-
         if (container) {
-            // It's inside another active block => “invalid free … not allocated”
-            // plus the "is X bytes inside a Y byte region allocated here" message.
+            // It's inside another active block
             size_t offset = pval - (uintptr_t)(container + 1);
             fprintf(stderr,
                 "MEMORY BUG: %s:%ld: invalid free of pointer %p, not allocated\n",
@@ -230,32 +298,14 @@ void dmalloc_free(void* ptr, const char* file, long line) {
                 container->file, container->line, ptr, offset, container->size);
             abort();
         } else {
-            // Not found in any active block
-            // Could be in a freed block => we can check the global list
-            // to see if it's "double free" or "wild pointer," but the assignment
-            // specifically wants "not allocated" unless it's exactly the same
-            // pointer as a previously-freed block that’s still recognized.
-            // The simplest approach: print "not allocated" & abort.
-            //
-            // If you *want* to detect “double free” of a pointer that was
-            // previously freed, you'd need to keep it around in `active_blocks_map`
-            // with an `active = false`. The assignment does require "double free"
-            // detection, so let's see if we find it in the global list
-            // with active=false:
-            //
-            // => We’ll do a quick linear or (optional) separate map for freed blocks
-            //    to see if it matches exactly that pointer. Then print "double free"
-            //    if so. But the instructions define "double free" specifically for
-            //    a pointer that matched a previously-active block. So let's do
-            //    a small check:
-
-            // check the global list for a matching pointer with active=false
-            // (This is O(n), but only hits in “rare” error cases.)
+            // Check if it’s a double free (same pointer, now inactive) 
+            // or a wild pointer. We'll do a quick scan:
             allocation_header* scan = allocation_list_head;
             while (scan) {
                 if ((void*)(scan + 1) == ptr) {
-                    // found a match in a freed block => double free
+                    // found the same pointer in the global list
                     if (!scan->active) {
+                        // double free
                         fprintf(stderr,
                             "MEMORY BUG: %s:%ld: invalid free of pointer %p, double free\n",
                             file, line, ptr);
@@ -264,8 +314,7 @@ void dmalloc_free(void* ptr, const char* file, long line) {
                 }
                 scan = scan->next;
             }
-
-            // Otherwise, not allocated
+            // Otherwise, truly "not allocated"
             fprintf(stderr,
                 "MEMORY BUG: %s:%ld: invalid free of pointer %p, not allocated\n",
                 file, line, ptr);
@@ -275,7 +324,6 @@ void dmalloc_free(void* ptr, const char* file, long line) {
 
     // 3. We found a matching active block in `header`. Check for double free
     if (!header->active) {
-        // We discovered it in the data structure but it's not active => double free
         fprintf(stderr,
             "MEMORY BUG: %s:%ld: invalid free of pointer %p, double free\n",
             file, line, ptr);
@@ -283,15 +331,12 @@ void dmalloc_free(void* ptr, const char* file, long line) {
     }
 
     // 4. Check the canaries
-    // Left canary in the header
     if (header->left_canary != CANARY_MAGIC) {
-        // The user wrote before the start of the block
         fprintf(stderr,
             "MEMORY BUG: %s:%ld: invalid free of pointer %p, not allocated\n",
             file, line, ptr);
         abort();
     }
-    // Right canary at the end of the user region
     unsigned long long* right_canary
         = (unsigned long long*)((char*) ptr + header->size);
     if (*right_canary != CANARY_MAGIC) {
@@ -319,7 +364,9 @@ void* dmalloc_calloc(size_t nmemb, size_t sz, const char* file, long line) {
     if (__builtin_mul_overflow(nmemb, sz, &total)) {
         // overflow => fail
         stats.nfail++;
-        stats.fail_size += (nmemb * sz);
+        // For “fail_size”, some folks add `nmemb * sz`, but it’s already overflowed;
+        // either approach is acceptable as long as you fail properly.
+        stats.fail_size += (unsigned long long) nmemb * sz;
         return nullptr;
     }
 
@@ -362,7 +409,54 @@ void dmalloc_print_leak_report() {
     }
 }
 
-// For Task 7 (heavy hitters), you would implement here:
+
+/// dmalloc_print_heavy_hitter_report()
+///    Gathers all (file, line) call sites that have allocated user bytes,
+///    sorts them in descending order by total bytes, then prints lines
+///    until we exceed 80% of total allocation. Only print anything if
+///    the top line is >= 20%.
 void dmalloc_print_heavy_hitter_report() {
-    // Not required for Task 6
+    // If no allocations, nothing to print
+    if (total_heavy_alloc == 0) {
+        return;
+    }
+
+    // 1. Gather all (file, line) => total_bytes into a vector
+    std::vector<std::pair<fileline, unsigned long long>> info;
+    info.reserve(heavy_map.size());
+    for (auto const& kv : heavy_map) {
+        info.push_back(kv);
+    }
+
+    // 2. Sort descending by total_bytes
+    std::sort(info.begin(), info.end(),
+              [](auto const& a, auto const& b) {
+                  return a.second > b.second;
+              });
+
+    // 3. Check if the top line is < 20% => then print nothing
+    double top_fraction
+        = double(info[0].second) / double(total_heavy_alloc);
+    if (top_fraction < 0.20) {
+        // no "heavy hitters"
+        return;
+    }
+
+    // 4. Print lines from top until we exceed 80% total
+    double sum_fraction = 0.0;
+    for (auto const& p : info) {
+        double frac = double(p.second) / double(total_heavy_alloc);
+        sum_fraction += frac;
+
+        // Print this line
+        double percent = frac * 100.0;
+        printf("HEAVY HITTER: %s:%ld: %llu bytes (~%.1f%%)\n",
+               p.first.file, p.first.line,
+               (unsigned long long) p.second, percent);
+
+        // If we’ve reached 80% or more, stop
+        if (sum_fraction >= 0.80) {
+            break;
+        }
+    }
 }

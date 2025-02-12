@@ -1,5 +1,3 @@
-// dmalloc.cc
-
 #define M61_DISABLE 1
 #include "dmalloc.hh"
 #include <cstdlib>
@@ -9,19 +7,32 @@
 #include <cassert>
 
 // ----- GLOBAL STATE -----
-
 static dmalloc_statistics stats;
 
+static const unsigned long long CANARY_MAGIC = 0xDEADC0DEDEADC0DEULL;
+
 struct allocation_header {
-    size_t size;
-    const char* file;
-    long line;
+    // Left canary
+    unsigned long long left_canary;
+
+    // Linked list pointers
     allocation_header* prev;
     allocation_header* next;
+
+    // Original request size
+    size_t size;
+
+    // File & line that allocated this block
+    const char* file;
+    long line;
+
+    // Mark if block is currently active
+    bool active;
 };
 
 static allocation_header* alloc_list_head = nullptr;
 
+// Insert node at head of active list
 static void insert_into_alloc_list(allocation_header* node) {
     node->prev = nullptr;
     node->next = alloc_list_head;
@@ -31,6 +42,7 @@ static void insert_into_alloc_list(allocation_header* node) {
     alloc_list_head = node;
 }
 
+// Remove node from active list
 static void remove_from_alloc_list(allocation_header* node) {
     if (node->prev) {
         node->prev->next = node->next;
@@ -42,29 +54,51 @@ static void remove_from_alloc_list(allocation_header* node) {
     }
 }
 
+static allocation_header* find_active_allocation(void* ptr) {
+    // linear search
+    allocation_header* cur = alloc_list_head;
+    while (cur) {
+        if ((void*) (cur + 1) == ptr) {
+            return cur;
+        }
+        cur = cur->next;
+    }
+    return nullptr;
+}
+
 // ----- DMALLOC FUNCTIONS -----
 
 void* dmalloc_malloc(size_t sz, const char* file, long line) {
-    // 1. Check for overflow
-    size_t total_size;
-    if (__builtin_add_overflow(sz, sizeof(allocation_header), &total_size)) {
+    // 1. Overflow check
+    size_t total;
+    if (__builtin_add_overflow(sz, sizeof(allocation_header), &total)) {
+        stats.nfail++;
+        stats.fail_size += sz;
+        return nullptr;
+    }
+    // Add space for right canary
+    if (__builtin_add_overflow(total, sizeof(unsigned long long), &total)) {
         stats.nfail++;
         stats.fail_size += sz;
         return nullptr;
     }
 
     // 2. Allocate
-    allocation_header* header = (allocation_header*) base_malloc(total_size);
+    allocation_header* header = (allocation_header*) base_malloc(total);
     if (!header) {
         stats.nfail++;
         stats.fail_size += sz;
         return nullptr;
     }
 
-    // 3. Initialize the metadata and insert into linked list
+    // 3. Initialize metadata
+    header->left_canary = CANARY_MAGIC;
     header->size = sz;
     header->file = file;
     header->line = line;
+    header->active = true;
+
+    // 3b. Insert into active list
     insert_into_alloc_list(header);
 
     // 4. Update statistics
@@ -73,9 +107,15 @@ void* dmalloc_malloc(size_t sz, const char* file, long line) {
     stats.nactive++;
     stats.active_size += sz;
 
-    // 5. Update heap_min/heap_max using *user* region
-    uintptr_t user_start = (uintptr_t) (header + 1);
-    uintptr_t user_end_exclusive = user_start + sz;    // pointer + size
+    // 5. Set right canary
+    void* user_ptr = (void*) (header + 1);  // Start of user data
+    unsigned long long* right_c = (unsigned long long*)
+        ((char*) user_ptr + sz);
+    *right_c = CANARY_MAGIC;
+
+    // 6. Update heap_min & heap_max for the *user* region
+    uintptr_t user_start = (uintptr_t) user_ptr;
+    uintptr_t user_end_exclusive = user_start + sz;
     if (stats.heap_min == 0 || user_start < stats.heap_min) {
         stats.heap_min = user_start;
     }
@@ -83,42 +123,86 @@ void* dmalloc_malloc(size_t sz, const char* file, long line) {
         stats.heap_max = user_end_exclusive;
     }
 
-    // 6. Return pointer after metadata
-    return (void*) (header + 1);
+    // 7. Return user pointer
+    return user_ptr;
 }
 
-
 void dmalloc_free(void* ptr, const char* file, long line) {
-    (void) file;
-    (void) line;
-
     if (!ptr) {
-        return;  // free(nullptr) is no-op
+        return;  // free(nullptr) => no-op
     }
 
-    // 1) Recover our header
-    allocation_header* header = (allocation_header*) ptr - 1;
+    // Attempt to find this pointer in active allocations
+    allocation_header* header = find_active_allocation(ptr);
+    if (!header) {
+        // Not in active list => invalid free or double free
+        // But we also do a quick range check to tailor the message
+        uintptr_t pval = (uintptr_t) ptr;
+        if (pval < stats.heap_min || pval >= stats.heap_max) {
+            fprintf(stderr,
+                    "MEMORY BUG: %s:%ld: invalid free of pointer %p, not in heap\n",
+                    file, line, ptr);
+        } else {
+            // Could be double free or partial pointer. 
+            // If your tests want a specific "double free" vs "invalid free" 
+            // message, you can do more checks. 
+            fprintf(stderr,
+                    "MEMORY BUG: %s:%ld: invalid free of pointer %p, not allocated\n",
+                    file, line, ptr);
+        }
+        abort();
+    }
 
-    // 2) Remove from active list
+    // Check left canary
+    if (header->left_canary != CANARY_MAGIC) {
+        fprintf(stderr,
+                "MEMORY BUG: %s:%ld: invalid free of pointer %p, not allocated\n",
+                file, line, ptr);
+        abort();
+    }
+    // Check right canary
+    unsigned long long* right_c = (unsigned long long*)
+        ((char*) ptr + header->size);
+    if (*right_c != CANARY_MAGIC) {
+        fprintf(stderr,
+                "MEMORY BUG: %s:%ld: detected wild write during free of pointer %p\n",
+                file, line, ptr);
+        abort();
+    }
+
+    // Check if already freed => double free
+    if (!header->active) {
+        fprintf(stderr,
+                "MEMORY BUG: %s:%ld: double free of pointer %p\n",
+                file, line, ptr);
+        abort();
+    }
+
+    // OK: remove from active list & mark inactive
     remove_from_alloc_list(header);
+    header->active = false;
 
-    // 3) Update statistics
+    // Update stats
     stats.nactive--;
     stats.active_size -= header->size;
 
-    // 4) Free
+    // Free
     base_free(header);
 }
 
 void* dmalloc_calloc(size_t nmemb, size_t sz, const char* file, long line) {
+    // Protect from overflow: nmemb * sz
     size_t total;
     if (__builtin_mul_overflow(nmemb, sz, &total)) {
         stats.nfail++;
         stats.fail_size += (nmemb * sz);
         return nullptr;
     }
+
+    // Now call dmalloc_malloc, which also checks “+ header + canary”
     void* ptr = dmalloc_malloc(total, file, line);
     if (ptr) {
+        // Zero out
         memset(ptr, 0, total);
     }
     return ptr;
@@ -140,12 +224,11 @@ void dmalloc_print_statistics() {
 
 void dmalloc_print_leak_report() {
     for (allocation_header* p = alloc_list_head; p; p = p->next) {
-        // Example format
         printf("LEAK CHECK: %p size %zu alloc [%s:%ld]\n",
                (void*) (p + 1), p->size, p->file, p->line);
     }
 }
 
 void dmalloc_print_heavy_hitter_report() {
-    // Not yet implemented for part 1.1
+    // Not yet implemented
 }
